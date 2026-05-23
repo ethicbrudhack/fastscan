@@ -1,0 +1,2 @@
+# fastscan
+fastscan bitcoin
