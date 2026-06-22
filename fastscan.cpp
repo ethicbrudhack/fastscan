@@ -1,6 +1,7 @@
 // ==========================
-// FASTSCAN v2 – CPU TWEAK-ADD
-// BEZ JACOBIAN, SUPER STABILNE
+// FASTSCAN v2 – BTC (1, 3, bc1) 
+// 1(U) NIEZALEŻNY, 1(C)+bc1 POŁĄCZONE, 3 NIEZALEŻNY!
+// Z 24-BITOWYM INDEKSEM (128 MB) - SZYBSZY!
 // ==========================
 
 #include <iostream>
@@ -26,8 +27,8 @@
 // ===============================
 // PARAMETRY
 // ===============================
-static const uint64_t BLOCK_SIZE = 10'000ULL;
-static const int THREAD_COUNT = 15;
+static const uint64_t BLOCK_SIZE = 13'379ULL;
+static const int THREAD_COUNT = 30;
 
 std::mutex log_mutex;
 
@@ -67,22 +68,119 @@ private:
     size_t size;
 };
 
-bool contains_address_bin(const MMapFile& mm, const unsigned char addr20[20]) {
-    const unsigned char* base = mm.ptr();
-    size_t count = mm.length() / 20;
+// ===============================
+// 24-BITOWY INDEKS PREFIKSOWY (128 MB)
+// ===============================
+class PrefixIndex24 {
+private:
+    const MMapFile& mm;
+    std::vector<uint64_t> index;
+    bool ready;
 
-    size_t lo = 0, hi = count;
-    while (lo < hi) {
-        size_t mid = (lo + hi) / 2;
-        const unsigned char* midp = base + mid * 20;
-
-        int cmp = memcmp(midp, addr20, 20);
-        if (cmp == 0) return true;
-        if (cmp < 0) lo = mid + 1;
-        else hi = mid;
+    static inline uint32_t get_prefix24(const unsigned char* p) {
+        return (uint32_t(p[0]) << 16) | (uint32_t(p[1]) << 8) | uint32_t(p[2]);
     }
-    return false;
-}
+
+public:
+    PrefixIndex24(const MMapFile& m) : mm(m), ready(false) {
+        index.resize(16777217);
+        build();
+    }
+
+    void build() {
+        const unsigned char* base = mm.ptr();
+        uint64_t count = mm.length() / 20;
+        
+        std::cout << "📦 Budowanie 24-bitowego indeksu dla " << count << " adresów...\n";
+        std::cout << "📊 Rozmiar indeksu: ~" << (index.size() * sizeof(uint64_t)) / (1024*1024) << " MB\n";
+        
+        auto start_time = std::chrono::steady_clock::now();
+
+        uint64_t pos = 0;
+        uint64_t buckets_found = 0;
+
+        while (pos < count) {
+            const unsigned char* rec = base + pos * 20;
+            uint32_t p = get_prefix24(rec);
+            
+            index[p] = pos;
+            
+            uint64_t lo = pos;
+            uint64_t hi = count;
+            
+            while (lo + 1 < hi) {
+                uint64_t mid = (lo + hi) / 2;
+                const unsigned char* mid_rec = base + mid * 20;
+                uint32_t mp = get_prefix24(mid_rec);
+                
+                if (mp <= p)
+                    lo = mid;
+                else
+                    hi = mid;
+            }
+            
+            index[p + 1] = lo + 1;
+            
+            pos = lo + 1;
+            buckets_found++;
+            
+            if (buckets_found % 1000 == 0) {
+                std::cout << "\r   Przetworzono: " << pos << "/" << count 
+                          << " rekordów | Znaleziono: " << buckets_found 
+                          << " prefiksów" << std::flush;
+            }
+        }
+        
+        uint64_t last_start = 0;
+        uint64_t last_end = count;
+        
+        for (int i = 16777215; i >= 0; i--) {
+            if (index[i] != 0 || i == 0) {
+                last_start = index[i];
+                last_end = index[i + 1];
+            } else {
+                index[i] = last_start;
+                index[i + 1] = last_end;
+            }
+        }
+
+        auto end_time = std::chrono::steady_clock::now();
+        double seconds = std::chrono::duration<double>(end_time - start_time).count();
+        
+        std::cout << "\n✅ Indeks zbudowany: " << buckets_found << "/16777216 prefiksów używanych\n";
+        std::cout << "⏱️  Czas budowy: " << std::fixed << std::setprecision(1) << seconds << " s\n";
+        std::cout << "📊 Pamięć indeksu: ~" << (index.size() * sizeof(uint64_t)) / (1024*1024) << " MB\n";
+        
+        ready = true;
+    }
+
+    // ==========================================
+    // contains() z 24-bitowym indeksem - SZYBSZY!
+    // ==========================================
+    bool contains(const unsigned char addr20[20]) const {
+        uint32_t p = get_prefix24(addr20);
+        
+        uint64_t lo = index[p];
+        uint64_t hi = index[p + 1];
+        
+        if (lo >= hi) {
+            return false;
+        }
+        
+        const unsigned char* base = mm.ptr();
+        
+        while (lo < hi) {
+            uint64_t mid = (lo + hi) / 2;
+            const unsigned char* midp = base + mid * 20;
+
+            int cmp = memcmp(midp, addr20, 20);
+            if (cmp == 0) return true;
+            if (cmp < 0) lo = mid + 1;
+            else hi = mid;
+        }
+        return false;
+    }
+};
 
 // ===============================
 // HASH TOOLS
@@ -116,7 +214,6 @@ struct FastPubCtx {
     bool initialized = false;
 };
 
-// dodanie +1 do pubkey
 inline void fast_priv_add_one(FastPubCtx& pc) {
     static const unsigned char ONE32[32] = {
         0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
@@ -130,15 +227,39 @@ inline void fast_load_priv(FastPubCtx& pc, const unsigned char priv[32]) {
     pc.initialized = true;
 }
 
-inline void fast_get_hash160(const FastPubCtx& pc, unsigned char hu[20], unsigned char hc[20]) {
-    unsigned char un[65]; size_t un_len = 65;
-    unsigned char co[33]; size_t c_len  = 33;
-
-    secp256k1_ec_pubkey_serialize(pc.ctx, un, &un_len, &pc.pub, SECP256K1_EC_UNCOMPRESSED);
-    secp256k1_ec_pubkey_serialize(pc.ctx, co, &c_len , &pc.pub, SECP256K1_EC_COMPRESSED);
-
-    pubkey_hash160(un, un_len, hu);
-    pubkey_hash160(co, c_len , hc);
+// ============================================================
+// SZYBKIE HASHE - BTC + P2SH
+// ============================================================
+inline void fast_get_btc_hashes(const FastPubCtx& pc, 
+                                 unsigned char hu[20],
+                                 unsigned char hc[20],
+                                 unsigned char p2sh_hash[20]) {
+    unsigned char pub[65]; 
+    size_t pub_len = 65;
+    secp256k1_ec_pubkey_serialize(pc.ctx, pub, &pub_len, &pc.pub, 
+                                  SECP256K1_EC_UNCOMPRESSED);
+    
+    // ==========================================
+    // 1. BTC uncompressed (1...) - NIEZALEŻNY!
+    // ==========================================
+    pubkey_hash160(pub, 65, hu);
+    
+    // ==========================================
+    // 2. BTC compressed (1...) + SegWit (bc1...)
+    // ==========================================
+    unsigned char compressed[33];
+    compressed[0] = (pub[64] & 1) ? 0x03 : 0x02;
+    memcpy(compressed + 1, pub + 1, 32);
+    pubkey_hash160(compressed, 33, hc);
+    
+    // ==========================================
+    // 3. BTC P2SH (3...) - NIEZALEŻNY!
+    // ==========================================
+    unsigned char redeem_script[22];
+    redeem_script[0] = 0x00;
+    redeem_script[1] = 0x14;
+    memcpy(redeem_script + 2, hc, 20);
+    pubkey_hash160(redeem_script, 22, p2sh_hash);
 }
 
 // ===============================
@@ -157,7 +278,7 @@ std::string base58_encode(const std::vector<unsigned char>& in) {
     std::string out;
     while (!BN_is_zero(bn)) {
         BN_div(dv, rem, bn, b58, ctx);
-        out.insert(out.begin(), BASE58[ BN_get_word(rem) ]);
+        out.insert(out.begin(), BASE58[BN_get_word(rem)]);
         BN_copy(bn, dv);
     }
 
@@ -169,7 +290,7 @@ std::string base58_encode(const std::vector<unsigned char>& in) {
     return out;
 }
 
-std::string ripemd_to_base58(const unsigned char ripe[20]) {
+std::string addr_p2pkh(const unsigned char ripe[20]) {
     std::vector<unsigned char> ext;
     ext.push_back(0x00);
     ext.insert(ext.end(), ripe, ripe+20);
@@ -182,20 +303,100 @@ std::string ripemd_to_base58(const unsigned char ripe[20]) {
     return base58_encode(ext);
 }
 
+std::string addr_p2sh(const unsigned char ripe[20]) {
+    std::vector<unsigned char> ext;
+    ext.push_back(0x05);
+    ext.insert(ext.end(), ripe, ripe+20);
+
+    unsigned char c1[32], c2[32];
+    sha256_once(ext.data(), ext.size(), c1);
+    sha256_once(c1, 32, c2);
+
+    ext.insert(ext.end(), c2, c2+4);
+    return base58_encode(ext);
+}
+
+// ===============================
+// BECH32 - SEGWIT (bc1...)
+// ===============================
+std::string bech32_encode(const std::string& hrp, const std::vector<uint8_t>& data) {
+    const std::string CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+    
+    auto polymod = [](const std::vector<uint8_t>& values) -> uint32_t {
+        const uint32_t GEN[] = {0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3};
+        uint32_t chk = 1;
+        for (uint8_t v : values) {
+            uint32_t top = chk >> 25;
+            chk = ((chk & 0x1ffffff) << 5) ^ v;
+            for (size_t i = 0; i < 5; ++i) {
+                if ((top >> i) & 1) chk ^= GEN[i];
+            }
+        }
+        return chk;
+    };
+    
+    auto hrp_expand = [](const std::string& h) -> std::vector<uint8_t> {
+        std::vector<uint8_t> ret;
+        for (char c : h) ret.push_back((uint8_t)(c >> 5));
+        ret.push_back(0);
+        for (char c : h) ret.push_back((uint8_t)(c & 0x1f));
+        return ret;
+    };
+    
+    std::string result = hrp + "1";
+    for (uint8_t v : data) {
+        if (v >= 32) return "";
+        result += CHARSET[v];
+    }
+    
+    std::vector<uint8_t> values = hrp_expand(hrp);
+    values.insert(values.end(), data.begin(), data.end());
+    values.insert(values.end(), {0,0,0,0,0,0});
+    uint32_t mod = polymod(values) ^ 1;
+    
+    for (int i = 0; i < 6; ++i) {
+        result += CHARSET[(mod >> (5 * (5 - i))) & 31];
+    }
+    
+    return result;
+}
+
+std::string addr_segwit(const unsigned char h160[20]) {
+    std::vector<uint8_t> data;
+    data.push_back(0);
+    
+    uint64_t acc = 0;
+    size_t bits = 0;
+    std::vector<uint8_t> converted;
+    for (size_t i = 0; i < 20; i++) {
+        acc = (acc << 8) | h160[i];
+        bits += 8;
+        while (bits >= 5) {
+            bits -= 5;
+            converted.push_back((acc >> bits) & 0x1F);
+        }
+    }
+    if (bits > 0) {
+        converted.push_back((acc << (5 - bits)) & 0x1F);
+    }
+    data.insert(data.end(), converted.begin(), converted.end());
+    
+    return bech32_encode("bc", data);
+}
+
 // ===============================
 // SAVE FOUND
 // ===============================
-void save_found(const char* prefix, const unsigned char priv[32], bool comp) {
+void save_found(const std::string& addr, const unsigned char priv[32], const std::string& type) {
     std::lock_guard<std::mutex> lk(log_mutex);
 
     std::ofstream f("found.txt", std::ios::app);
-    f << prefix << (comp ? " (C) " : " (U) ");
-
+    f << type << ": " << addr << "\nPRIV: ";
     for (int i = 0; i < 32; i++)
         f << std::hex << std::setw(2) << std::setfill('0') << (int)priv[i];
-    f << "\n";
+    f << std::dec << "\n---\n";
 
-    std::cout << "\n🎯 ZNALEZIONO " << prefix << (comp ? " (C)\n" : " (U)\n");
+    std::cout << "\n🎯 ZNALEZIONO " << type << ": " << addr << "\n";
 }
 
 // ===============================
@@ -214,6 +415,47 @@ bool load_state(uint64_t& r, uint64_t& c) {
 }
 
 // ===============================
+// SKANOWANIE - 1(U) NIEZALEŻNY, 1(C)+bc1 POŁĄCZONE, 3 NIEZALEŻNY!
+// Z 24-BITOWYM INDEKSEM
+// ===============================
+inline void scan_key_fast(FastPubCtx& fctx, const unsigned char priv[32], const PrefixIndex24& idx) {
+    // ==========================================
+    // HASHE - wszystkie 3 typy
+    // ==========================================
+    unsigned char hU[20], hC[20], p2sh_h[20];
+    fast_get_btc_hashes(fctx, hU, hC, p2sh_h);
+    
+    // ==========================================
+    // 1. BTC P2PKH (U) - NIEZALEŻNY!
+    // ==========================================
+    if (idx.contains(hU)) {
+        std::string addr = addr_p2pkh(hU);
+        save_found(addr, priv, "BTC P2PKH (U)");
+    }
+    
+    // ==========================================
+    // 2. BTC P2PKH (C) + SegWit (bc1...) - POŁĄCZONE!
+    // ==========================================
+    if (idx.contains(hC)) {
+        std::string addr = addr_p2pkh(hC);
+        save_found(addr, priv, "BTC P2PKH (C)");
+        
+        std::string segwit = addr_segwit(hC);
+        if (!segwit.empty()) {
+            save_found(segwit, priv, "BTC SegWit");
+        }
+    }
+    
+    // ==========================================
+    // 3. BTC P2SH (3...) - NIEZALEŻNY!
+    // ==========================================
+    if (idx.contains(p2sh_h)) {
+        std::string addr = addr_p2sh(p2sh_h);
+        save_found(addr, priv, "BTC P2SH");
+    }
+}
+
+// ===============================
 // MAIN
 // ===============================
 int main(int argc, char* argv[]) {
@@ -223,10 +465,27 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    std::cout << "📂 Ładowanie pliku: " << argv[1] << "\n";
     MMapFile mm(argv[1]);
+    
     int start_bit = std::stoi(argv[2]);
     int end_bit   = std::stoi(argv[3]);
     bool resume = (argc >= 5 && std::string(argv[4]) == "--resume");
+
+    uint64_t total_bytes = mm.length();
+    uint64_t total_mb = total_bytes / (1024*1024);
+    uint64_t total_gb = total_bytes / (1024*1024*1024);
+    uint64_t addr_count = total_bytes / 20;
+    
+    std::cout << "📏 Rozmiar: " << total_gb << " GB (" << total_mb << " MB)\n";
+    std::cout << "🔢 Adresów: " << addr_count << "\n";
+    std::cout << "🔥 Skanuję: 1(U) NIEZALEŻNY, 1(C)+bc1 POŁĄCZONE, 3 NIEZALEŻNY!\n";
+    std::cout << "⚡ Używam 24-bitowego indeksu (128 MB) - SZYBSZY!\n";
+
+    // ==========================================
+    // 24-BITOWY INDEKS (128 MB)
+    // ==========================================
+    PrefixIndex24 prefix_idx(mm);
 
     secp256k1_context* ctx_master =
         secp256k1_context_create(SECP256K1_CONTEXT_SIGN);
@@ -253,6 +512,7 @@ int main(int argc, char* argv[]) {
     while (true) {
 
         uint64_t CHUNKS = round_idx * 34563ULL;
+        if (CHUNKS > 100000) CHUNKS = 100000;
 
         std::cout << "\n🔁 Runda " << round_idx
                   << " | chunks=" << CHUNKS
@@ -263,41 +523,19 @@ int main(int argc, char* argv[]) {
 
         BIGNUM* stride = BN_new();
         BN_div(stride, nullptr, RLEN, bn_chunks, bnctx);
-          
-          
-        // =====================================================
-// DEBUG: wypisz pierwsze 15 chunków (pełne 32 bajty)
-// =====================================================
-{
-    BN_CTX* tc = BN_CTX_new();
-    BIGNUM* tmp = BN_new();
-    BIGNUM* index_bn = BN_new();
-
-    std::cout << "\n📌 Pierwsze 15 chunków (pełne 32 bajty):\n";
-
-    for (int ci = 0; ci < 15 && ci < CHUNKS; ci++) {
-
-        BN_set_word(index_bn, ci);
-
-        // tmp = R0 + ci * stride
-        BN_mul(tmp, index_bn, stride, tc);
-        BN_add(tmp, tmp, R0);
-
-        unsigned char priv_debug[32];
-        BN_bn2binpad(tmp, priv_debug, 32);
-
-        char fullhex[65];
-        for (int z = 0; z < 32; z++)
-            sprintf(fullhex + z*2, "%02X", priv_debug[z]);
-
-        std::cout << "Chunk " << ci
-                  << "  PRIV=" << fullhex << "\n";
-    }
-
-    BN_free(tmp);
-    BN_free(index_bn);
-    BN_CTX_free(tc);
-}
+        
+        if (BN_is_zero(stride)) {
+            while (BN_is_zero(stride) && CHUNKS > 1) {
+                BN_free(bn_chunks);
+                BN_free(stride);
+                CHUNKS = CHUNKS / 2;
+                if (CHUNKS < 1) CHUNKS = 1;
+                bn_chunks = BN_new();
+                BN_set_word(bn_chunks, CHUNKS);
+                stride = BN_new();
+                BN_div(stride, nullptr, RLEN, bn_chunks, bnctx);
+            }
+        }
 
         std::atomic<uint64_t> next(chunk_idx);
         std::atomic<uint64_t> keys_done(0), chunks_done(0);
@@ -352,20 +590,7 @@ int main(int argc, char* argv[]) {
                         if (!fctx.initialized) fast_load_priv(fctx, priv);
                         else fast_priv_add_one(fctx);
 
-                        unsigned char hU[20], hC[20];
-                        fast_get_hash160(fctx, hU, hC);
-
-                        if (contains_address_bin(mm, hU))
-                            save_found(
-                                ripemd_to_base58(hU).c_str(),
-                                priv, false
-                            );
-
-                        if (contains_address_bin(mm, hC))
-                            save_found(
-                                ripemd_to_base58(hC).c_str(),
-                                priv, true
-                            );
+                        scan_key_fast(fctx, priv, prefix_idx);
 
                         BN_add_word(privBN, 1);
                         keys_done++;
